@@ -1,49 +1,42 @@
 import torch
 from torchvision import datasets, transforms
 from torch.utils.data import DataLoader
+import analyze
 
 class CNN(torch.nn.Module):
     def __init__(self):
         super(CNN, self).__init__()
-        self.conv = torch.nn.Sequential(
-            torch.nn.Conv2d(in_channels=3, out_channels=64, kernel_size=3, padding=1),
-            torch.nn.BatchNorm2d(64),
-            torch.nn.GELU(),
-            torch.nn.Dropout(0.1),
-            torch.nn.MaxPool2d(kernel_size=2),
-            torch.nn.Conv2d(in_channels=64, out_channels=128, kernel_size=3, padding=1),
-            torch.nn.BatchNorm2d(128),
-            torch.nn.GELU(),
-            torch.nn.Dropout(0.1),
-            torch.nn.MaxPool2d(kernel_size=2),
-            torch.nn.Conv2d(
-                in_channels=128, out_channels=256, kernel_size=3, padding=1
-            ),
-            torch.nn.BatchNorm2d(256),
-            torch.nn.GELU(),
-            torch.nn.Dropout(0.1),
-            torch.nn.MaxPool2d(kernel_size=2),
-            torch.nn.Conv2d(
-                in_channels=256, out_channels=512, kernel_size=3, padding=1
-            ),
-            torch.nn.BatchNorm2d(512),
-            torch.nn.GELU(),
-            torch.nn.Dropout(0.1),
-            torch.nn.MaxPool2d(kernel_size=2),
-        )
+        self.conv1 = CNN.conv_factory(3, 64, DROP)
+        self.conv2 = CNN.conv_factory(64, 128, DROP)
+        self.conv3 = CNN.conv_factory(128, 256, DROP)
+        self.conv4 = CNN.conv_factory(256, 512, DROP)
 
         self.fc = torch.nn.Sequential(
             torch.nn.Linear(512 * 2 * 2, 512),
             torch.nn.GELU(),
-            torch.nn.Dropout(0.3),
+            torch.nn.Dropout(DROP),
             torch.nn.Linear(512, 256),
             torch.nn.GELU(),
-            torch.nn.Dropout(0.3),
+            torch.nn.Dropout(DROP),
             torch.nn.Linear(256, 100),
         )
 
+    @staticmethod
+    def conv_factory(in_channels, out_channels, rate):
+        return torch.nn.Sequential(
+            torch.nn.Conv2d(in_channels=in_channels, out_channels=out_channels, kernel_size=3, padding=1),
+            torch.nn.BatchNorm2d(out_channels),
+            torch.nn.GELU(),
+            torch.nn.Dropout(rate),
+            torch.nn.MaxPool2d(kernel_size=2),
+        )
+
     def forward(self, inp):
-        inp = self.conv(inp)
+        inp = self.conv1(inp)
+        inp = self.conv2(inp)
+        inp = self.conv3(inp)
+        inp = self.conv4(inp)
+
         inp = inp.view(-1, 512 * 2 * 2)
         inp = self.fc(inp)
         return inp
@@ -69,8 +62,8 @@ def test(model, device, dataloader):
         output = model(data)
         pre = output.argmax(axis=1, keepdims=True)
         correct += pre.eq(target.view_as(pre)).sum().item()
-    print(f"testing acc {correct / 100}%")
-    return correct / 100
+    print(f"testing acc {correct * 100 / train_dataset.__len__()}%")
+    return correct / train_dataset.__len__()
 
 
 if __name__ == "__main__":
@@ -101,44 +94,47 @@ if __name__ == "__main__":
 
     train_loader = DataLoader(
         dataset=train_dataset,
-        batch_size=1024,
+        batch_size=64,
         shuffle=True,
-        num_workers=12,
+        num_workers=8,
         persistent_workers=True,
         drop_last=True,
     )
 
     test_loader = DataLoader(
         dataset=test_dataset,
-        batch_size=1000,
+        batch_size=100,
         shuffle=False,
-        num_workers=12,
-    )
-    model = CNN()
-    optimizer = torch.optim.SGD(
-        model.parameters(), lr=0.1, weight_decay=5e-4, momentum=0.9
+        num_workers=8,
     )
 
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode="max", factor=0.5, patience=5
-    )
-    criterion = torch.nn.CrossEntropyLoss()
-
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model.to(device)
-
-    if torch.cuda.device_count() > 1:
-        print(f"使用 {torch.cuda.device_count()} 个GPU")
-    model = torch.nn.DataParallel(model)
-
+    device = "mps"
     best_acc = 0
-    for x in range(100):
-        train(model, criterion, optimizer, train_loader, device)
-        acc = test(model, device, test_loader)
-        scheduler.step(acc)
-        if acc > best_acc:
-            best_acc = acc
-            torch.save(model.state_dict(), "./best_model.pth")
-            print("保存最佳模型")
-        print(f"epoch {x} finished")
-    print(f"best acc is {best_acc}%")
+    for y in range(9):
+        DROP = y/10
+        acc_list = []
+        model = CNN()
+        model.to(device)
+        optimizer = torch.optim.SGD(
+            model.parameters(), lr=0.1, weight_decay=5e-4, momentum=0.9
+        )
+
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer, mode="max", factor=0.5, patience=5
+        )
+        criterion = torch.nn.CrossEntropyLoss()
+        for x in range(1000):
+            train(model, criterion, optimizer, train_loader, device)
+            acc = test(model, device, test_loader)
+            scheduler.step(acc)
+            acc_list.append(acc*100)
+            if acc > best_acc:
+                best_acc = acc
+            print(f"drop = {DROP} || epoch {x} finished")
+        analyze.save_floats_to_excel(
+            float_list=acc_list,
+            excel_filename=f"drop={DROP}.xlsx",
+            sheet_name="DATA",
+        )
+        print(f"✅ drop = {DROP} || best acc is {best_acc*100}%")
+
