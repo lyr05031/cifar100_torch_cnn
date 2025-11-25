@@ -2,6 +2,9 @@ import torch
 from torchvision import datasets, transforms
 from torch.utils.data import DataLoader
 import analyze
+import random
+import numpy as np
+
 
 class CNN(torch.nn.Module):
     def __init__(self):
@@ -24,8 +27,13 @@ class CNN(torch.nn.Module):
     @staticmethod
     def conv_factory(in_channels, out_channels, rate):
         return torch.nn.Sequential(
-            torch.nn.Conv2d(in_channels=in_channels, out_channels=out_channels, kernel_size=3, padding=1),
-            torch.nn.BatchNorm2d(out_channels),
+            torch.nn.Conv2d(
+                in_channels=in_channels,
+                out_channels=out_channels,
+                kernel_size=3,
+                padding=1,
+            ),
+            torch.nn.BatchNorm2d(out_channels, momentum=0.9),
             torch.nn.GELU(),
             torch.nn.Dropout(rate),
             torch.nn.MaxPool2d(kernel_size=2),
@@ -44,13 +52,18 @@ class CNN(torch.nn.Module):
 
 def train(model, criterion, optimizer, dataloader, device):
     model.train()
+    correct = 0
     for data, target in dataloader:
         data, target = data.to(device), target.to(device)
         optimizer.zero_grad()
         output = model.forward(data)
+        pre = output.argmax(axis=1, keepdims=True)
+        correct += pre.eq(target.view_as(pre)).sum().item()
         loss = criterion(output, target)
         loss.backward()
         optimizer.step()
+    print(f"training acc {correct * 100 / train_dataset.__len__()}%")
+    return correct / train_dataset.__len__()
 
 
 @torch.no_grad()
@@ -62,8 +75,14 @@ def test(model, device, dataloader):
         output = model(data)
         pre = output.argmax(axis=1, keepdims=True)
         correct += pre.eq(target.view_as(pre)).sum().item()
-    print(f"testing acc {correct * 100 / train_dataset.__len__()}%")
-    return correct / train_dataset.__len__()
+    print(f"testing acc {correct * 100 / test_dataset.__len__()}%")
+    return correct / test_dataset.__len__()
+
+
+def worker_init_fn(worker_id):
+    worker_seed = torch.initial_seed() % 2**32
+    np.random.seed(worker_seed)
+    random.seed(worker_seed)
 
 
 if __name__ == "__main__":
@@ -96,45 +115,62 @@ if __name__ == "__main__":
         dataset=train_dataset,
         batch_size=64,
         shuffle=True,
-        num_workers=8,
-        persistent_workers=True,
         drop_last=True,
+        worker_init_fn=worker_init_fn,
     )
 
     test_loader = DataLoader(
         dataset=test_dataset,
         batch_size=100,
         shuffle=False,
-        num_workers=8,
     )
 
     device = "mps"
-    best_acc = 0
-    for y in range(9):
-        DROP = y/10
-        acc_list = []
+
+    torch.manual_seed(42)
+    torch.mps.manual_seed(42)
+
+    for y in range(0, 10):
+        best_acc = 0
+        DROP = y / 10
+        test_acc_list = []
+        train_acc_list = []
         model = CNN()
         model.to(device)
-        optimizer = torch.optim.SGD(
-            model.parameters(), lr=0.1, weight_decay=5e-4, momentum=0.9
-        )
-
+        optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=0.05)
         scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
             optimizer, mode="max", factor=0.5, patience=5
         )
         criterion = torch.nn.CrossEntropyLoss()
-        for x in range(1000):
-            train(model, criterion, optimizer, train_loader, device)
-            acc = test(model, device, test_loader)
-            scheduler.step(acc)
-            acc_list.append(acc*100)
-            if acc > best_acc:
-                best_acc = acc
+        x = 0
+        cnt = 0
+        while 1:
+            train_acc = train(model, criterion, optimizer, train_loader, device)
+            test_acc = test(model, device, test_loader)
             print(f"drop = {DROP} || epoch {x} finished")
+            scheduler.step(test_acc)
+            test_acc_list.append(test_acc * 100)
+            train_acc_list.append(train_acc * 100)
+            x += 1
+            cnt += 1
+            if test_acc > best_acc:
+                best_acc = test_acc
+                cnt = 0
+            if cnt >= 20:
+                print(
+                    f"drop = {y / 10} complete\n total epoch {x} best acc {best_acc * 100}%"
+                )
+                del model, optimizer, scheduler, criterion
+                torch.mps.empty_cache()
+                break
         analyze.save_floats_to_excel(
-            float_list=acc_list,
-            excel_filename=f"drop={DROP}.xlsx",
+            float_list=test_acc_list,
+            excel_filename=f"drop={DROP}_test.xlsx",
             sheet_name="DATA",
         )
-        print(f"✅ drop = {DROP} || best acc is {best_acc*100}%")
-
+        analyze.save_floats_to_excel(
+            float_list=train_acc_list,
+            excel_filename=f"drop={DROP}_train.xlsx",
+            sheet_name="DATA",
+        )
+        print(f"drop = {y / 10} saved")
